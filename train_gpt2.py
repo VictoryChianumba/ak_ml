@@ -33,10 +33,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs) 
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs) 
         # attention (materializes the large (T, T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim = 1)
-        y = att @ v 
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim = 1)
+        # y = att @ v 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
         y = y.transpose(1, 2).contiguous().view(B,T,C) # assemble all head outputs side by side 
         # output projection 
         y = self.c_proj(y)
@@ -51,17 +53,17 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
         
     def forward(self, x):
-        x = self.c_fc
-        x = self.gelu
-        x = self.c_proj
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
         return x
         
 
 class Block(nn.Module):
     
     def __init__(self, config):
-        super().__init()
-        self.ln_1 = nn.LayerNorm(config.vocab_size)
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
@@ -73,11 +75,11 @@ class Block(nn.Module):
         
 @dataclass
 class GPTConfig:
-    block_size = 1024
-    vocab_size = 50257
-    n_layer = 12
-    n_head = 12
-    n_embd = 768
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
     
 class GPT(nn.Module):
     def __init__(self, config):
@@ -110,8 +112,10 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-    
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -163,53 +167,60 @@ class GPT(nn.Module):
         return model
     
 # --------------------------
-# num_return_sequences = 5
-# max_length = 30
-
-model = GPT.from_pretrained('gpt2')
-# model.eval()    
-print('yay i didnt crash')
-
-# device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-# model.to(device)
-
-# Now every call runs on the GPU
+num_return_sequences = 5
+max_length = 30
     
 # prefix tokens 
-# import tiktoken 
-# enc = tiktoken.get_encoding('gpt2')
-# tokens = enc.enconde("Hey i am a language model")  
-# tokens = torch.tensor(tokens, dtype=torch.long) #(8,)
-# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5, 8)
-# x = tokens.to(device)
+import tiktoken 
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)  
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1]) 
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+model = GPT.from_pretrained('gpt2')
+# model = GPT(GPTConfig)
+device = torch.device('cpu')
+model.to(device)
+# Now every call runs on the GPU
+# logits, loss = model(x, y)
+
+optimizer = torch.optim.Adam(model.parameters(), lr = 3e-4)
+for i in range(50):
+    pass
+
+import sys; sys.exit(0)
 
 # generate! right now, x is (B, T) where B = 5 and T = 8
 # set the seed to 42
-
 torch.manual_seed(42)
 torch.mps.manual_seed(42)
-# while x.size(1) < max_length:
-#     # forward the model to get logits
-#     with torch.no_grad():
-#         logits = model(x) # (B, T, vocab size)
-#         # we take the logits at the last position 
-#         logits = logits[:,-1,:] # B, vocab_size
-#         # get the probabilities 
-#         probs = F.softmax(logits, dim=-1)
-#         # do top-k sampling of 50 (hugging face pipeline default)
-#         # topk_probs become (5, 50), topk_indices becomes (5, 50)
-#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-#         # select token from the top-k probabilities
-#         ix = torch.multinomial(topk_probs, 1) #(B, 1)
-#         # gather the corresponding indices 
-#         xcol = torch.gather(topk_indices, 1, ix) #(B, 1)
-#         # append to the sequence    
-#         x = torch.cat((x, xcol), dim=1)
+while x.size(1) < max_length:
+    # forward the model to get logits
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab size)
+        # we take the logits at the last position 
+        logits = logits[:, -1, :] # B, vocab_size
+        # get the probabilities 
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (hugging face pipeline default)
+        # topk_probs become (5, 50), topk_indices becomes (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1) #(B, 1)
+        # gather the corresponding indices 
+        xcol = torch.gather(topk_indices, 1, ix) #(B, 1)
+        # append to the sequence    
+        x = torch.cat((x, xcol), dim=1)
 
-# # print the generated text
-# for i in range(num_return_sequences):
-#      token = x[:max_length].to_list()
-#      decode = enc.decode(token)
-#      print(">", decode)
+# print the generated text
+for i in range(num_return_sequences):
+     token = x[i, :max_length].tolist()
+     decode = enc.decode(token)
+     print(">", decode)
             
         
